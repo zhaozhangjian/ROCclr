@@ -530,6 +530,46 @@ bool LightningProgram::setKernels(amd::option::Options* options, void* binary, s
                                    std::string::npos);
     kernels()[kernelName] = aKernel;
   }
+
+#if COMPILE_DISPATCH_CAPTURE
+  // skip handling internal kernels such as ones used for memcpy
+  if (!isInternal()) {
+    uint64_t binaryBegin = UINT64_MAX;
+    std::vector<device::Kernel::kerninfo_t> ki_vec;
+    for (auto it : kernels()) {
+      uint64_t kernelCodeEntry = it.second->KernelCodeHandle();
+      binaryBegin = binaryBegin > kernelCodeEntry ? kernelCodeEntry : binaryBegin;
+      // 191:128 in code object v3 kernel descriptor indicates the byte offset (possibly negative)
+      // from base address of kernel descriptor to kernel’s entry point instruction.
+      uint64_t machineCodeEntry = (uint64_t)kernelCodeEntry + ((int64_t*)kernelCodeEntry)[2];
+      device::Kernel::kerninfo_t ki = {kernelCodeEntry, 64, machineCodeEntry, 0, 0, it.first};
+      ki_vec.push_back(std::move(ki));
+    }
+    uint64_t binaryEnd = binaryBegin + binSize;
+
+    std::sort(ki_vec.begin(), ki_vec.end(),
+              [](const device::Kernel::kerninfo_t& l, const device::Kernel::kerninfo_t& r)->bool {
+                return l.code_entry < r.code_entry;
+              });
+
+    size_t i = 0;
+    size_t last_idx = ki_vec.size() ? ki_vec.size() - 1 : 0;
+    for (; i < last_idx; ++i) {
+      ki_vec[i].code_size = ki_vec[i+1].code_entry - ki_vec[i].code_entry;
+    }
+    ki_vec[i].code_size = binaryEnd - ki_vec[i].code_entry;
+
+    for (auto it : kernels()) {
+      auto rt = std::find_if(ki_vec.cbegin(), ki_vec.cend(),
+                          [it](const device::Kernel::kerninfo_t& l)->bool {
+                            return l.desc_entry == it.second->KernelCodeHandle();
+                          });
+      assert(rt != ki_vec.end() && "Not found kernel info.");
+      it.second->KernelInfo() = std::move(*rt);
+      ki_vec.erase(rt);
+    }
+  }
+#endif  // defined(COMPILE_DISPATCH_CAPTURE)
 #endif  // defined(USE_COMGR_LIBRARY)
   return true;
 }

@@ -115,6 +115,19 @@ if(DEV_LOG_ENABLE MATCHES "yes")
   add_definitions(-DDEV_LOG_ENABLE)
 endif()
 
+# Enable dispatch capture compilation
+# Use -DCOMPILE_DISPATCH_CAPTURE=1 to compile ROCclr with dispatch capture feature,
+# enabled at run time by bool type environment variable ENABLE_DISPATCH_CAPTURE.
+# Dispatch capture feature dumps AQL dispatch packet, kernel object (kernel descriptor
+# and machine code), kernel arg pool and kernel arg details.
+# !!! Please NOTE that this feature may cause PERFORMANCE DROP, even not used !!!
+# Just ignore or explicitly use -DCOMPILE_DISPATCH_CAPTURE=0 at compile time to disable this feature.
+if (COMPILE_DISPATCH_CAPTURE EQUAL 1)
+    add_definitions(-DCOMPILE_DISPATCH_CAPTURE=1)
+else()
+    add_definitions(-DCOMPILE_DISPATCH_CAPTURE=0)
+endif()
+
 option(BUILD_PAL "Build PAL backend" OFF)
 if (BUILD_PAL)
   add_subdirectory(device/pal)

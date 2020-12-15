@@ -354,6 +354,18 @@ class Kernel : public amd::HeapObject {
     int maxOccupancyPerCu_;           //!< Max occupancy per compute unit in threads
   };
 
+#if COMPILE_DISPATCH_CAPTURE
+  //!< The kernel descriptor entries, sizes and machine code entries,sizes and names of kernels
+  typedef struct _kerninfo {
+    uint64_t desc_entry;
+    uint64_t desc_size;
+    uint64_t code_entry;
+    uint64_t code_size;
+    uint64_t dump_count;
+    std::string name;
+  } kerninfo_t;
+#endif
+
   //! Default constructor
   Kernel(const amd::Device& dev, const std::string& name, const Program& prog);
 
@@ -458,6 +470,11 @@ class Kernel : public amd::HeapObject {
 
   const uint64_t KernelCodeHandle() const { return kernelCodeHandle_; }
 
+#if COMPILE_DISPATCH_CAPTURE
+  const kerninfo_t& KernelInfo() const { return kernelInfo_;}
+  kerninfo_t& KernelInfo() { return kernelInfo_;}
+#endif
+
   const uint32_t WorkgroupGroupSegmentByteSize() const { return workgroupGroupSegmentByteSize_; }
   void SetWorkgroupGroupSegmentByteSize(uint32_t size) { workgroupGroupSegmentByteSize_ = size; }
 
@@ -521,6 +538,10 @@ class Kernel : public amd::HeapObject {
   uint32_t workitemPrivateSegmentByteSize_ = 0;
   uint32_t kernargSegmentByteSize_ = 0;   //!< Size of kernel argument buffer
   uint32_t kernargSegmentAlignment_ = 0;
+
+#if COMPILE_DISPATCH_CAPTURE
+  kerninfo_t kernelInfo_;
+#endif
 
   union Flags {
     struct {

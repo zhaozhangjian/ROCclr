@@ -40,6 +40,10 @@
 #include <limits>
 #include <thread>
 
+#if COMPILE_DISPATCH_CAPTURE
+#include <iomanip>
+#endif
+
 /**
 * HSA image object size in bytes (see HSAIL spec)
 */
@@ -2349,6 +2353,129 @@ bool VirtualGPU::submitKernelInternal(const amd::NDRangeContainer& sizes, const 
       aqlHeaderWithOrder |= (HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_ACQUIRE_FENCE_SCOPE);
       addSystemScope_ = false;
     }
+
+#if COMPILE_DISPATCH_CAPTURE
+    if (ENABLE_DISPATCH_CAPTURE) {
+      // ====== dispatch capture begin ======
+      device::Kernel::kerninfo_t& ki = devKernel->KernelInfo();
+      std::string filename = ki.name + "_" + std::to_string(ki.dump_count++) + ".rpl";
+      std::ofstream dcout(filename, std::ios::out);
+
+      uint32_t kern_arg_num = signature.numParameters();
+      uint32_t kern_arg_all = signature.numParametersAll();
+
+      dcout << "$compute_queue index=0x0\n";
+      dcout << "#kernel_name: " << ki.name << "\n";
+      dcout << "@aql_pkt pkt_id=0x" << std::hex << HSA_PACKET_TYPE_KERNEL_DISPATCH
+            << " pkt_num=0x0" << " addr=" << &dispatchPacket << "\n";
+
+      // 1/4 Dump dispatch packet
+      uint32_t header_setup = aqlHeaderWithOrder | ((sizes.dimensions() << HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS) << 16);
+      dcout << "0x" << std::setw(8) << std::setfill('0') << header_setup << "\n";
+      for (size_t i = 1; i < sizeof(hsa_kernel_dispatch_packet_t) / sizeof(uint32_t); ++i) {
+        dcout << "0x" << std::setw(8) << std::setfill('0') << reinterpret_cast<uint32_t*>(&dispatchPacket)[i] << "\n";
+      }
+
+      // 2/4 Dump kernel object
+      constexpr size_t MACHINE_CODE_ALIGN= 256;
+      // kernel descriptor is of 64B in code object v3, while CP assumes machine code entry is aligned to 256B,
+      // we add 256-64=192B padding here.
+      unsigned char* diy_kernel_descriptor = new unsigned char[MACHINE_CODE_ALIGN]{0};
+      memcpy(diy_kernel_descriptor, reinterpret_cast<void*>(ki.desc_entry), ki.desc_size);
+      reinterpret_cast<uint64_t*>(diy_kernel_descriptor)[2] = MACHINE_CODE_ALIGN; // assign the entry offset
+
+      dcout << "@kernel_obj pkt_num=0x0 args=0x" << kern_arg_all
+            << " bytes=0x" << MACHINE_CODE_ALIGN + ki.code_size << " addr=0x" << ki.desc_entry << "\n";
+      for (size_t i = 0; i < MACHINE_CODE_ALIGN / sizeof(uint32_t); ++i) {
+        dcout << "0x" << std::setw(8) << std::setfill('0') << reinterpret_cast<uint32_t*>(diy_kernel_descriptor)[i] << "\n";
+      }
+      for (size_t i = 0; i < ki.code_size / sizeof(uint32_t); ++i) {
+        dcout << "0x" << std::setw(8) << std::setfill('0') << reinterpret_cast<uint32_t*>(ki.code_entry)[i] << "\n";
+      }
+      delete []diy_kernel_descriptor;
+
+      // 3/4 Dump kernel arg pool
+      uint64_t argbuffer = reinterpret_cast<uint64_t>(argBuffer);
+      dcout << "@kernel_arg_pool pkt_num=0x0 args_num=0x" << signature.numParametersAll()
+            << " addr=0x" << argbuffer << " bytes=0x" << gpuKernel.KernargSegmentByteSize() << "\n";
+      for (size_t i = 0; i < gpuKernel.KernargSegmentByteSize() / sizeof(uint32_t); ++i) {
+        dcout << "0x" << std::setw(8) << std::setfill('0') << reinterpret_cast<uint32_t*>(argBuffer)[i] << "\n";
+      }
+
+      // 4/4 Dump kernel arg details
+      enum {
+        ARG_VALUE_KIND_NOT_SUPPORTED = 0,
+        ARG_VALUE_KIND_GLOBAL_BUFFER,
+        ARG_VALUE_KIND_BY_VALUE,
+        ARG_VALUE_KIND_RESERVED,
+        ARG_VALUE_KIND_IMAGE,
+        ARG_VALUE_KIND_SAMPLER,
+      };
+
+      amd::Memory* const* memories = reinterpret_cast<amd::Memory* const*>(parameters + kernelParams.memoryObjOffset());
+      // visible parameters
+      for (size_t i = 0; i < kern_arg_num; ++i) {
+        const amd::KernelParameterDescriptor& kpd = signature.at(i);
+        if (kpd.type_ == T_POINTER && kpd.addressQualifier_ != CL_KERNEL_ARG_ADDRESS_LOCAL) { // skip LDS
+          amd::Memory* mem = memories[kpd.info_.arrayIndex_];
+          Memory* devMem = static_cast<roc::Memory*>(mem->getDeviceMemory(dev(), false));
+          uint64_t devmem_addr = reinterpret_cast<uint64_t>(devMem->getDeviceMemory());
+          size_t devmem_size = mem->getSize();
+
+          if(kpd.info_.oclObject_ == amd::KernelParameterDescriptor::MemoryObject) {
+            dcout << "#kernel_arg_" << i << " size=" << kpd.size_ << " offset=0x" << kpd.offset_
+                  << " value_kind=0x" << ARG_VALUE_KIND_GLOBAL_BUFFER
+                  << " value=0x" << (reinterpret_cast<uint64_t*>(argbuffer + kpd.offset_))[0] << "\n"
+                  << "@kernel_arg pkt_num=0x0 arg_idx=0x" << i << " arg_type=0x" << 1 << " offset=0x" << kpd.offset_
+                  << " addr=0x" << devmem_addr << " bytes=0x" << devmem_size << " in\n";
+            for (size_t j = 0; j < devmem_size / sizeof(uint32_t); ++j) {
+              dcout << "0x" << std::setw(8) << std::setfill('0') << reinterpret_cast<uint32_t*>(devmem_addr)[j] << "\n";
+            }
+          } else if (kpd.info_.oclObject_ == amd::KernelParameterDescriptor::ImageObject) {
+            dcout << "WARNING: image parameter is not supported yet.\n";
+          } else {
+            dcout << "ERROR: unsupported visible parameter of idx=" << i << " type=" << kpd.info_.oclObject_ << "\n";
+          }
+        } else if (kpd.type_ == T_VOID && kpd.info_.oclObject_ == amd::KernelParameterDescriptor::ValueObject) {
+          dcout << "#kernel_arg_" << i << " size=" << kpd.size_ << " offset=0x" << kpd.offset_
+                << " value_kind=0x" << ARG_VALUE_KIND_BY_VALUE
+                << " value=0x" << (reinterpret_cast<uint64_t*>(argbuffer + kpd.offset_))[0] << "\n"
+                << "@kernel_arg pkt_num=0x0 arg_idx=0x" << i << " arg_type=0x" << 2 << " offset=0x" << kpd.offset_
+                << " addr=0x" << 0 << " bytes=0x" << kpd.size_ << " in\n";
+        } else {
+          dcout << "ERROR: unsopported visible parameter of idx=" << i << " type=" << kpd.info_.oclObject_ << "\n";
+        }
+      }
+      // hidden parameters
+      for (size_t i = kern_arg_num; i < kern_arg_all; ++i) {
+        const amd::KernelParameterDescriptor& kpd = signature.at(i);
+
+        switch(kpd.info_.oclObject_) {
+          case amd::KernelParameterDescriptor::HiddenNone:
+          case amd::KernelParameterDescriptor::HiddenGlobalOffsetX:
+          case amd::KernelParameterDescriptor::HiddenGlobalOffsetY:
+          case amd::KernelParameterDescriptor::HiddenGlobalOffsetZ:
+          case amd::KernelParameterDescriptor::HiddenMultiGridSync: {
+            dcout << "#kernel_arg_" << i << " size=" << kpd.size_ << " offset=0x" << kpd.offset_
+                  << " value_kind=0x" << ARG_VALUE_KIND_BY_VALUE
+                  << " value=0x" << (reinterpret_cast<uint64_t*>(argbuffer + kpd.offset_))[0] << "\n"
+                  << "@kernel_arg pkt_num=0x0 arg_idx=0x" << i << " arg_type=0x" << 2 << " offset=0x" << kpd.offset_
+                  << " addr=0x" << 0 << " bytes=0x" << kpd.size_ << " in\n";
+            break;
+          }
+          case amd::KernelParameterDescriptor::HiddenHostcallBuffer:
+          case amd::KernelParameterDescriptor::HiddenPrintfBuffer:
+          case amd::KernelParameterDescriptor::HiddenDefaultQueue:
+          case amd::KernelParameterDescriptor::HiddenCompletionAction: {
+            dcout << "ERROR: Unsopported hidden parameter of idx=" << i << " type=" << kpd.info_.oclObject_ << "\n";
+            break;
+          }
+        }
+      }
+      dcout << std::endl;
+      // ====== dispatch capture finish ======
+    } // end if(ENABLE_DISPATCH_CAPTURE)
+#endif // defined (COMPILE_DISPATCH_CAPTURE)
 
     // Dispatch the packet
     if (!dispatchAqlPacket(
